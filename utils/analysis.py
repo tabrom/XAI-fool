@@ -601,7 +601,7 @@ def get_wandb_id(entity, project, model_name, dataset, approach, extra_filters):
     Returns the run ID if found, else None.
 
     Sample: 
-    get_wandb_id(entity='tabrom',
+    get_wandb_id(entity='anonuser',
              project='xai_fooling',
              model_name='custom-bert',
              dataset='sst2',
@@ -771,4 +771,4 @@ def get_table_topk(attr_file_rank, attr_file_topk, attr_file_ref, ignore_cls=Fal
 
 
 def check_checkpoint(run_id): 
-    print(os.listdir(f'/vol/csedu-nobackup/project/tromanski/results/{run_id}/'))
+    print(os.listdir(f'/vol/csedu-nobackup/project/anonuser/results/{run_id}/'))

@@ -6,14 +6,14 @@
 #SBATCH --mem=30G
 #SBATCH --gres=gpu:1
 #SBATCH --time=03:00:00
-#SBATCH --output=/home/tromanski/thesis/logs/run_exp-%j.out
-#SBATCH --error=/home/tromanski/thesis/logs/run_exp-%j.errHi
+#SBATCH --output=/home/anonuser/thesis/logs/run_exp-%j.out
+#SBATCH --error=/home/anonuser/thesis/logs/run_exp-%j.errHi
 
 
 # example location:
 args=(--model_name custom-bert #albert/albert-base-v2 #custom-bert # custom-bert-finetuned
   --epochs 4
-  --model_dir /vol/csedu-nobackup/project/tromanski
+  --model_dir /vol/csedu-nobackup/project/anonuser
   --run_id  bljl78zc # rrqjwtk2 lyudw589
   --eval_only # bool flag
   --get_attributions # bool flag

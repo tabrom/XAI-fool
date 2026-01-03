@@ -45,7 +45,7 @@ class BertConfig(object):
             return self.__dict__
         
 def get_chkpt_path(run_id, model_type):
-    base_path = '/vol/csedu-nobackup/project/tromanski/results/'
+    base_path = '/vol/csedu-nobackup/project/anonuser/results/'
 
     chkpt_path = os.path.join(base_path, run_id)
     if not os.path.isdir(chkpt_path):
@@ -87,7 +87,7 @@ def load_custom_bert(device=None, finetuned=False, explain=False, train=True, ru
     
 
     if finetuned:
-        params = torch.load('/home/tromanski/XAI_Transformers_/SST/sst2-3layer-model.pt', map_location=torch.device(device))
+        params = torch.load('/home/anonuser/XAI_Transformers_/SST/sst2-3layer-model.pt', map_location=torch.device(device))
         model.load_state_dict(params, strict=False)
     elif run_id is not None:
         chkpt_path = get_chkpt_path(run_id, model_type='bert')
@@ -259,7 +259,7 @@ def get_explanations_path(args, dataset_split='train', use_results=False, use_vo
         model = 'bert'
 
     if use_vol:
-        save_dir = '/vol/csedu-nobackup/project/tromanski/results_attr'
+        save_dir = '/vol/csedu-nobackup/project/anonuser/results_attr'
     else:
         save_dir = args.project_dir
 

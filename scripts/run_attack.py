@@ -22,7 +22,7 @@ def main():
     parser = argparse.ArgumentParser(description="Finetune a HuggingFace Transformers model.")
     parser.add_argument("--model_name", type=str, required=True, help="Model name or path (e.g., bert-base-uncased)")
     parser.add_argument("--tokenizer_name", type=str, required=False, default=None, help="Tokenizer name or path (if different from model)")
-    parser.add_argument("--project_dir", type=str, required=False, default='/home/tromanski/thesis', help="Project directory")
+    parser.add_argument("--project_dir", type=str, required=False, default='/home/anonuser/thesis', help="Project directory")
     parser.add_argument("--model_dir", type=str, required=False, default=None, help="Directory to save the finetuned model (sub of project dir)")
     # this does not work, if I pass anything it becomes True, if I dont it is False
     # parser.add_argument("--eval_only", type=bool, required=False, default=False, help="Only evaluate the model without training")

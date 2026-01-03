@@ -330,7 +330,7 @@ def swap_attention_with_detachable(model: nn.Module):
 
 def load_xai_albert(model_name, device='cpu', mean_detach=False, std_detach=False, run_id=None):
     if run_id is not None:
-        base_path = '/vol/csedu-nobackup/project/tromanski/results/'
+        base_path = '/vol/csedu-nobackup/project/anonuser/results/'
 
         chkpt_path = os.path.join(base_path, run_id)
         if not os.path.isdir(chkpt_path):

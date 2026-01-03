@@ -12,7 +12,7 @@ from collections import defaultdict
 import argparse
 
 import sys
-sys.path.append('/home/tromanski/thesis/')
+sys.path.append('/home/anonuser/thesis/')
 
 from utils.generic import load_custom_bert, get_explanations_path, \
     configure_tokenizer, get_sst_dataset, TrainerDataset
@@ -81,7 +81,7 @@ def main():
     parser.add_argument('--model_name', type=str, required=True, help='name of the model to use (bert-base-uncased or albert-base-v2)')
     parser.add_argument('--dataset', type=str, required=True, help='name of the dataset to use (sst or imdb)')
     parser.add_argument('--n_tokens', type=int, default=10, help='number of target tokens to extract')
-    parser.add_argument('--project_dir', type=str, default='/home/tromanski/thesis/', help='path to the project directory')
+    parser.add_argument('--project_dir', type=str, default='/home/anonuser/thesis/', help='path to the project directory')
     parser.add_argument('--use_top_tokens', action='store_true', help='whether to use top tokens or random tokens with certain frequency')
     parser.add_argument('--expl_method', type=str, default='LRP', help='explanation method used to get attributions')
     args = parser.parse_args()
