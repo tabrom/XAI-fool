@@ -149,7 +149,7 @@ def main():
                     masked = og_expl.copy()
                     masked[0] = -np.inf # ignore CLS token - it's always largest 
                 else:
-                    masked = og_expl # if it breaks for LRP then because of this - untested change 
+                    masked = og_expl 
                 top_idxs = np.argpartition(masked,-args.k)[-args.k:] # get indices of top-k largest values, not sorted
                 expl_mask[top_idxs] = 1
             elif args.approach == 'tokens':
@@ -168,22 +168,7 @@ def main():
                         expl_mask[idx] = 1
             elif args.approach == 'uniform':
                 expl_mask = np.ones(len(sample))*R_MEAN # global macro mean 
-                # og_expl = batch_sample['og_R']
-                # R_mean = np.mean(og_expl)
-                # expl_mask = np.array([1 if val >= R_mean else 0 for val in og_expl])
-
-             
-
-                # option for mse:
-                # expl_mask = og_expl
-                # if label == 1: # positive class
-                #     target_token_ids = target_tok_pos
-                # else:
-                #     target_token_ids = target_tok_neg
-                # for idx, token_id in enumerate(sample):
-                #     if token_id in target_token_ids:
-                #         expl_mask[idx] = 0
-                        # double check KL reaction for this 
+            
                         
             masks.append(expl_mask)
 
@@ -299,7 +284,7 @@ def main():
         compute_metrics=compute_metrics,
         optimizers=(optimizer, scheduler),
         # callbacks=[SkipOnNonFiniteGrads],
-        expl_loss_fn=args.loss_fn, # KL_soft, MSE_micro, MSE_macro, KL_hard
+        expl_loss_fn=args.loss_fn, 
         lambda_expl=args.lmbd,
         approach=args.approach, 
         expl_method=args.expl_method, 

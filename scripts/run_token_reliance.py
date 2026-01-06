@@ -157,13 +157,6 @@ def main():
                         expl_mask[idx] = 1
                         if args.approach == 'tokens_unk':
                             sample[idx] = tokenizer.unk_token_id # comment this out to get accuracy on original tokens
-                     
-                # if token_found and args.approach == 'tokens_unk':
-                #     new_enc.append(sample)
-                #     new_labels.append(batch_sample['label'])
-                #     new_expl_mask.append(expl_mask)
-                #     continue # skip appending at end of loop
-
                         
             elif args.approach == 'increase_tokens':
                 target_token_ids = batch_sample['target_token_ids']
@@ -172,30 +165,9 @@ def main():
                         expl_mask[idx] = 1
             elif args.approach == 'uniform':
                 expl_mask = np.ones(len(sample))*R_MEAN # global macro mean 
-                # og_expl = batch_sample['og_R']
-                # R_mean = np.mean(og_expl)
-                # expl_mask = np.array([1 if val >= R_mean else 0 for val in og_expl])
-
-             
-
-                # option for mse:
-                # expl_mask = og_expl
-                # if label == 1: # positive class
-                #     target_token_ids = target_tok_pos
-                # else:
-                #     target_token_ids = target_tok_neg
-                # for idx, token_id in enumerate(sample):
-                #     if token_id in target_token_ids:
-                #         expl_mask[idx] = 0
-                        # double check KL reaction for this 
                         
             masks.append(expl_mask)
 
-        # if args.approach == 'tokens_unk':
-        #     enc['input_ids'] = new_enc
-        #     enc['labels'] = new_labels
-        #     enc['expl_mask'] = new_expl_mask
-        # else:
         enc["expl_mask"] = masks
         enc["labels"] = batch["label"]
         return enc
@@ -245,7 +217,7 @@ def main():
         )
         print("Filtered dataset size (only samples where target token was found):", {split: len(tokenized[split]) for split in tokenized})
     data_collator = DataCollatorWithExpl(tokenizer)
-    # tokenizer, model = configure_tokenizer(tokenizer, model)
+    
         
     # making it possible checkpoint and run settings simultaneously
     if args.approach == 'topk':
@@ -304,8 +276,7 @@ def main():
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
         optimizers=(optimizer, scheduler),
-        # callbacks=[SkipOnNonFiniteGrads],
-        expl_loss_fn=args.loss_fn, # KL_soft, MSE_micro, MSE_macro, KL_hard
+        expl_loss_fn=args.loss_fn, 
         lambda_expl=args.lmbd,
         approach=args.approach, 
         expl_method=args.expl_method,
