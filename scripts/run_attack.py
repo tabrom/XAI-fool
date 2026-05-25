@@ -1,8 +1,12 @@
 import os 
+import ast
 import sys 
 import json 
 import argparse
-import torch 
+import time
+import torch
+import torch._functorch.config as functorch_config
+functorch_config.donated_buffer=False
 from torch.utils.data import SequentialSampler 
 import numpy as np
 import wandb
@@ -13,16 +17,98 @@ from transformers import AutoModelForSequenceClassification, \
 sys.path.append(os.getcwd())
 
 from utils.generic import load_custom_bert, build_optimizer_and_scheduler,\
-    configure_tokenizer, get_explanations_path, prep_data
+    configure_tokenizer, get_explanations_path, prep_data, get_num_classes,\
+    truncate_modernbert, get_model_chkpt_path
+from utils.config import model_mapping, tokenizer_mapping
 from utils.attack import AttackTrainer, DataCollatorWithExpl, SkipOnNonFiniteGrads, eval_attack
 from XAI_Transformers.utils import load_xai_albert
+from XAI_Transformers.xai_distilbert import DistilBertForSequenceClassificationXAI
+from XAI_Transformers.xai_modernbert import ModernBertForSequenceClassificationXAI
+
+
+def _make_serializable(args_obj):
+    out = {}
+    for k, v in vars(args_obj).items():
+        try:
+            json.dumps(v)
+            out[k] = v
+        except Exception:
+            out[k] = str(v)
+    return out
+
+
+def write_run_args(args_obj, run_obj=None):
+    """Ensure args_obj.run_id is set from wandb run and write args to a shared JSON.
+
+    Writes to: <args.project_dir>/logs/run_args.json keyed by run id (or timestamp key).
+    Uses atomic replace to reduce partial writes.
+    """
+    if getattr(args_obj, "run_id", None) is None:
+        rid = None
+        if run_obj is not None:
+            rid = getattr(run_obj, "id", None)
+        if rid is None and hasattr(wandb, "run") and wandb.run is not None:
+            rid = getattr(wandb.run, "id", None)
+        args_obj.run_id = rid
+
+    args_dict = _make_serializable(args_obj)
+
+    logs_dir = os.path.join(args_obj.project_dir, "logs") if getattr(args_obj, "project_dir", None) else os.path.join(os.path.dirname(__file__), "..", "logs")
+    logs_dir = os.path.abspath(logs_dir)
+    os.makedirs(logs_dir, exist_ok=True)
+    json_path = os.path.join(logs_dir, "run_args.json")
+
+    try:
+        if os.path.exists(json_path):
+            with open(json_path, "r") as f:
+                existing = json.load(f)
+        else:
+            existing = {}
+    except Exception:
+        existing = {}
+    
+    key = max(list(existing.keys())) + 1 if len(existing) > 0 else 1 
+
+    existing[key] = args_dict
+
+    tmp_path = json_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(existing, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, json_path)
+
+bs_mapping = {
+    'custom-bert': {
+        'sst2': 32,
+        'stanfordnlp/imdb': 16,
+        'fever': 32,
+        'esnli': 16,
+    },
+    'albert/albert-base-v2': {
+        'sst2': 32,
+        'stanfordnlp/imdb': 4,
+        'fever': 4,
+        'esnli': 16,
+    },
+    'distilbert': {
+        'sst2': 32,
+        'stanfordnlp/imdb': 8, #16, - for lrp, 8 for gae 
+        'fever': 16,
+        'esnli': 32,
+    },
+    'modernbert': {
+        'sst2': 32,
+        'stanfordnlp/imdb': 4, # 8 for lrp, 4 for gae
+        'fever': 16,
+        'esnli': 32,
+    },
+}
 
 
 def main():
     parser = argparse.ArgumentParser(description="Finetune a HuggingFace Transformers model.")
     parser.add_argument("--model_name", type=str, required=True, help="Model name or path (e.g., bert-base-uncased)")
     parser.add_argument("--tokenizer_name", type=str, required=False, default=None, help="Tokenizer name or path (if different from model)")
-    parser.add_argument("--project_dir", type=str, required=False, default='/home/anonuser/thesis', help="Project directory")
+    parser.add_argument("--project_dir", type=str, required=False, default='', help="Project directory")
     parser.add_argument("--model_dir", type=str, required=False, default=None, help="Directory to save the finetuned model (sub of project dir)")
     # this does not work, if I pass anything it becomes True, if I dont it is False
     # parser.add_argument("--eval_only", type=bool, required=False, default=False, help="Only evaluate the model without training")
@@ -45,40 +131,90 @@ def main():
     parser.add_argument("--is_test", default=False, help="Flag for wandb to filter test runs and delete")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--bs", type=int, default=None, help="Batch size (if different from default)")
-    parser.add_argument("--target_tokens", type=str, default=None, help="Location of txt file with target tokens (only for approach 'tokens')")
+    # parser.add_argument("--target_tokens", type=str, default=None, help="Location of txt file with target tokens (only for approach 'tokens')")
     parser.add_argument("--no_early_stopping", action='store_true', help="Disable saving best model - save last model instead")
     parser.add_argument("--expl_method", type=str, default='LRP', help="Explanation method to use: LRP, GAE")
     parser.add_argument("--run_id", type=str, help="run_id to load specific model (only for custom albert)")
     parser.add_argument("--switch_eval_method", action='store_true', help="Switch explanation method during loading of data (useful for eval on generalisation)")
     parser.add_argument("--use_second_order", action='store_true', help="Use second order gradients")
-    
-    args = parser.parse_args()
+    parser.add_argument("--get_curves", action='store_true', help="Get full explanation curves instead of attributions")
+    parser.add_argument("--margin", type=float, default=0.0, help="Margin for rank loss (only used if rank loss is selected)")
+    parser.add_argument("--pair", type=str, default=None, help="JSON-encoded dict with keys {lmbd, loss_fn}")
+    parser.add_argument("--use_test", action='store_true', help="Use test set for evaluation instead of validation set")
+    parser.add_argument("--update_results", action='store_true', help="Update results of a previous run (requires --run_id)")
+    parser.add_argument("--exclude_special_tokens", action='store_true', help="Exclude special tokens from explanation loss computation")
+    # args = parser.parse_args()
+    args, _ = parser.parse_known_args()
+    if args.bs is None:
+        args.bs = bs_mapping[args.model_name][args.dataset]
+    # default: not succeeded yet
+    args.run_succeeded = False
+    print('second order parser', args.use_second_order)
+    if args.pair is not None:
+        try:
+            pair = ast.literal_eval(args.pair)
+
+        except Exception as e:
+            raise ValueError(f"Invalid JSON passed to --pair: {args.pair}") from e
+
+        # Overwrite lmbd / loss_fn if present
+        if "lmbd" in pair:
+            args.lmbd = pair["lmbd"]
+        if "loss_fn" in pair:
+            args.loss_fn = pair["loss_fn"]
 
     if args.model_dir is None:
         args.model_dir = os.path.join(args.project_dir, 'results', args.model_name.replace('/', '_'))
     if args.tokenizer_name is None:
-        if "custom-bert" in args.model_name:
-            args.tokenizer_name = "google-bert/bert-base-uncased" # "textattack/bert-base-uncased-SST-2"
-        else:
-            args.tokenizer_name = args.model_name
+        args.tokenizer_name = tokenizer_mapping.get(args.model_name, args.model_name) 
     
     if args.approach == 'topk' and args.k is None: 
         parser.error("--approach topk requires --k")
-    if args.approach == 'topk' and args.loss_fn not in ['rank_topk', 'topk']:
-        parser.error("--approach topk only compatible with rank and topk loss")
-    if args.approach == 'location' and args.loss_fn == 'topk': 
-        parser.error("--approach location not compatible with topk loss")
+    if args.lmbd != 0:   
+        if args.approach == 'topk' and args.loss_fn not in ['rank_topk', 'topk']:
+            parser.error("--approach topk only compatible with rank and topk loss")
+        if args.approach == 'location' and args.loss_fn == 'topk': 
+            parser.error("--approach location not compatible with topk loss")
     if args.approach == 'location' and args.pos_target is None: 
         parser.error("--approach location requires --pos_target")
-    if args.approach == 'tokens' and args.target_tokens is None:
-        parser.error("--approach tokens requires --target_tokens")
+    # if args.approach == 'tokens' and args.target_tokens is None:
+    #     parser.error("--approach tokens requires --target_tokens")
+    if 'custom-bert' in args.model_name: 
+        tokens_model_name = 'bert'
+    elif 'albert' in args.model_name:
+        tokens_model_name = 'albert'
+    elif args.model_name == 'distilbert':
+        tokens_model_name = 'distilbert'
+    elif args.model_name == 'modernbert':
+        tokens_model_name = 'modernbert'
 
-    if args.bs is None: 
-        bs = 32 if (not 'imdb' in args.dataset) else 8 # otherwise OOM; could do it for custom bert but for comparability should not do it "or (args.model_name =='custom-bert')"
-        bs_val = 2*bs if (not 'imdb' in args.dataset) else bs
+    if args.dataset == 'sst2': 
+        tokens_dataset_name = 'sst'
+    elif 'imdb' in args.dataset:
+        tokens_dataset_name = 'imdb'
+    elif args.dataset == 'fever':
+        tokens_dataset_name = 'fever'
+    elif args.dataset == 'esnli':
+        tokens_dataset_name = 'esnli'
+    
+    if args.approach == 'tokens':
+        tokens_target = 'top_tokens'
+    elif args.approach == 'increase_tokens':
+        tokens_target = 'random_tokens'
     else:
-        bs = args.bs
-        bs_val = int(args.bs/2) if args.expl_method == 'GAE' and 'albert' in args.model_name and 'imdb' in args.dataset else args.bs # GAE expl method needs more memory for albert on imdb
+        tokens_target = ''
+
+    if args.switch_eval_method:
+        if args.expl_method == 'LRP':
+            expl_method_for_file = 'GAE'
+        elif args.expl_method == 'GAE':
+            expl_method_for_file = 'LRP'
+    
+    args.target_tokens = f'data/top_tokens/{expl_method_for_file}_{tokens_target}_{tokens_dataset_name}_{tokens_model_name}.json'
+    print("Target tokens file:", args.target_tokens)
+
+    bs = args.bs
+    bs_val = int(args.bs/2) if args.expl_method == 'GAE' else bs #and 'albert' in args.model_name and 'imdb' in args.dataset else args.bs # GAE expl method needs more memory for albert on imdb
 
     print("Model name:", args.model_name)
     print("Tokenizer name:", args.tokenizer_name)
@@ -115,6 +251,7 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    num_classes = get_num_classes(args.dataset)
 
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
@@ -128,6 +265,7 @@ def main():
         enc = tokenizer(
             batch["text"],
             truncation=True,
+            max_length=512,
             padding=False,
         )
         masks = [] 
@@ -168,7 +306,6 @@ def main():
                         expl_mask[idx] = 1
             elif args.approach == 'uniform':
                 expl_mask = np.ones(len(sample))*R_MEAN # global macro mean 
-            
                         
             masks.append(expl_mask)
 
@@ -178,15 +315,46 @@ def main():
 
     
     if args.model_name == "custom-bert":
-        model = load_custom_bert(device=device, finetuned=False, train=True, run_id=args.run_id)
+        model = load_custom_bert(device=device, finetuned=False, 
+                                 train=True, run_id=args.run_id, 
+                                 num_classes=num_classes)
     elif args.model_name == "custom-bert-finetuned":
-        model = load_custom_bert(device=device, finetuned=True, train=True)
+        model = load_custom_bert(device=device, 
+                                 finetuned=True, 
+                                 train=True)
     elif 'albert' in args.model_name:
         model = load_xai_albert(model_name=args.model_name, 
             device=device, 
             mean_detach=False, 
             std_detach=False,
-            run_id=args.run_id)
+            run_id=args.run_id, 
+            num_classes=num_classes,)
+    elif args.model_name == "distilbert":
+        if args.run_id is not None:
+            model_name = get_model_chkpt_path(args.run_id)
+        else:
+            model_name = "distilbert/distilbert-base-uncased" 
+        model = DistilBertForSequenceClassificationXAI.from_pretrained(
+            model_name, 
+            num_labels=num_classes,
+            ignore_mismatched_sizes=True
+        )
+        model = model.to(device)
+    elif args.model_name == "modernbert":
+        if args.run_id is not None:
+            model_name = get_model_chkpt_path(args.run_id)
+        else:
+            model_name = "answerdotai/ModernBERT-base" 
+        model = ModernBertForSequenceClassificationXAI.from_pretrained(
+            model_name,
+            num_labels=num_classes,
+            ignore_mismatched_sizes=True,
+        )
+        # Disable gradient checkpointing to avoid donated buffer incompatibility with retain_graph=True
+        # model.config.gradient_checkpointing = False
+        model = truncate_modernbert(model, 6)
+        model = model.to(device)
+
     else:
         model = AutoModelForSequenceClassification.from_pretrained(args.model_name)
 
@@ -244,6 +412,11 @@ def main():
                 project="xai_fooling", 
                 config=args
             )
+        # write args (and ensure run_id is set) to shared log
+        try:
+            write_run_args(args, run)
+        except Exception:
+            pass
         
     
     training_args = TrainingArguments(
@@ -278,20 +451,26 @@ def main():
         model=model,
         args=training_args,
         train_dataset=tokenized["train"],
-        eval_dataset=tokenized["validation"],
+        eval_dataset=tokenized["validation"] if not args.use_test else tokenized["test"],
         data_collator=data_collator,
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
         optimizers=(optimizer, scheduler),
         # callbacks=[SkipOnNonFiniteGrads],
-        expl_loss_fn=args.loss_fn, 
+        expl_loss_fn=args.loss_fn, # KL_soft, MSE_micro, MSE_macro, KL_hard
         lambda_expl=args.lmbd,
         approach=args.approach, 
         expl_method=args.expl_method, 
         use_second_order=args.use_second_order,
+        ref_attrs_file=get_explanations_path(args, dataset_split='val' if not args.use_test else 'test'),
+        rank_margin=args.margin if 'rank' in args.loss_fn else None,
+        
     )
     
-   
+    # before = {
+    #     name: p.detach().clone()
+    #     for name, p in model.named_parameters()
+    # }
     if not args.eval_only:
         print("Starting training...")
         trainer.train()
@@ -313,12 +492,47 @@ def main():
                     expl_method=args.expl_method,
                     approach=trainer.approach, 
                     compute_metrics=compute_metrics, 
-                    return_expl=True)
+                    return_expl=True, # comment line below and the other 
+                    ref_attrs_file=get_explanations_path(args, dataset_split='val' if not args.use_test else 'test'),
+                    )
         
         print("Validation set results:", eval_results)
+        if args.update_results and args.run_id is not None: 
+            
+            # ensure args.run_id is set and write
+            if args.use_test:
+                run = wandb.init(
+                project="xai_fooling",
+                entity="tabrom",          # optional if configured
+                id=args.run_id,
+                resume="must",
+                )
+                eval_results = {'eval/test_'+k:v for k,v in eval_results.items()}
+                run.summary.update(eval_results)
+                print("Updated test set results for run", args.run_id)
+
+            else:
+                eval_results = {'eval/'+k:v for k,v in eval_results.items()}
+                print("Not updating run results - validation set used for eval only")
+                print('Writing eval results to summary but not updating main results because validation set used for eval only')
+                if args.switch_eval_method:
+                    switch_str = f'_switched'
+                else:
+                    switch_str = ''
+                results_file = os.path.join(args.project_dir, "results", f"eval_results_{args.approach}_{tokens_model_name}_{tokens_dataset_name}_{args.run_id}_{args.expl_method}{switch_str}_baseline.json") # loss fn removed, baseline added  
+                with open(results_file, 'w') as f:
+                    json.dump(eval_results, f)
+                print(f"Saved eval results to {results_file}")
+            
+            try:
+                write_run_args(args, run)
+            except Exception:
+                pass
+            
 
         if args.get_attributions:
             attributions_val = {'attributions': val_expl, 'config': vars(args)}
+            dataset_split = 'test' if args.use_test else 'val'
             if not args.eval_only:
                 save_file = get_explanations_path(args, dataset_split='val', use_results=True, use_vol=True).replace('.json', f'{run.id}.json')
             elif args.run_id is not None:
@@ -326,17 +540,17 @@ def main():
                     switch_str = f'_switched'
                 else:
                     switch_str = ''
-                save_file = get_explanations_path(args, dataset_split='val', use_results=True, use_vol=True)\
+                save_file = get_explanations_path(args, dataset_split=dataset_split, use_results=True, use_vol=True)\
                     .replace('.json', f'{args.run_id}_{args.expl_method}{switch_str}.json')
             else:
                 r_id = np.random.randint(0, 1_000_000)
-                save_file = get_explanations_path(args, dataset_split='val', use_results=True, use_vol=True).replace('.json', f'_eval_only_{r_id}.json')
+                save_file = get_explanations_path(args, dataset_split=dataset_split, use_results=True, use_vol=True).replace('.json', f'_eval_only_{r_id}.json')
 
             with open(save_file, 'w') as f:
                 json.dump(attributions_val, f)
             print(f"Saved val attributions to {save_file}")
             
-        # train -- takes too long so disabled for now
+        # # train -- takes too long so disabled for now
         # dataloader = trainer._get_dataloader( # should be deterministic now 
         #     dataset=trainer.train_dataset,
         #     description="Training",
@@ -349,21 +563,51 @@ def main():
         #             expl_method=args.expl_method,
         #             approach=trainer.approach, 
         #             compute_metrics=compute_metrics, 
-        #             return_expl=True)
+        #             return_expl=True, 
+        #             # ref_attrs_file=get_explanations_path(args, dataset_split='train')
+        #             )
         
         # print("Train set results:", train_results)
 
         # if args.get_attributions: # will be saved in home dir! 
         #     attributions_train = {'attributions': train_expl, 'config': vars(args)}
         #     if not args.eval_only:
-        #         save_file = get_explanations_path(args, dataset_split='train', use_results=True).replace('.json', f'{run.id}.json')
+        #         save_file = get_explanations_path(args, dataset_split='train', use_results=True, use_vol=True).replace('.json', f'{run.id}.json')
         #     else:
-        #         save_file = get_explanations_path(args, dataset_split='train', use_results=True).replace('.json', f'_eval_only_{r_id}.json')
+        #         save_file = get_explanations_path(args, dataset_split='train', use_results=True, use_vol=True).replace('.json', f'_eval_only_{args.run_id}.json')
         #     with open(save_file, 'w') as f:
         #         json.dump(attributions_train, f)
         #     print(f"Saved train attributions to {save_file}")
 
- 
+        # updated = []
+        # for name, p in trainer.model.named_parameters():
+        #     if not torch.equal(before[name], p):
+        #         updated.append(name)
+
+        # print("Updated parameters:")
+        # for name in updated:
+        #     print(name)
+
+    # mark run as succeeded and update shared args + wandb summary
+    try:
+        args.run_succeeded = True
+        run_obj = globals().get('run', None)
+        if run_obj is None and hasattr(wandb, 'run') and wandb.run is not None:
+            run_obj = wandb.run
+        try:
+            write_run_args(args, run_obj)
+        except Exception:
+            pass
+        try:
+            if run_obj is not None:
+                # update wandb run summary with final success flag
+                run_obj.summary.update({'run_succeeded': True})
+        except Exception:
+            pass
+    except Exception:
+        pass
+    
 
 if __name__ == "__main__":
     main()
+    

@@ -73,6 +73,7 @@ class AttackTrainer(Trainer):
         return self.eval_attack(is_eval_loop=True)
     
     def _maybe_log_save_evaluate(
+            # taken from transformers.trainer.Trainer._maybe_log_save_evaluate, but adapted to log expl loss and metrics more correctly (log every logging_steps, not just when global step increases, and log expl loss separately)
         self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=None
     ):
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:

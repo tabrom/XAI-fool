@@ -1,5 +1,4 @@
-# quick script to get the top n most important tokens for model/dataset pair 
-# or random tokens based on frequency
+# quick script to get the top n most important tokens for model/dataset pair
 
 import json 
 import numpy as np
@@ -7,7 +6,7 @@ import pandas as pd
 import torch
 import os 
 from transformers import AutoTokenizer
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from collections import defaultdict
 import argparse
 
@@ -15,8 +14,10 @@ import sys
 sys.path.append('/home/anonuser/thesis/')
 
 from utils.generic import load_custom_bert, get_explanations_path, \
-    configure_tokenizer, get_sst_dataset, TrainerDataset
+    configure_tokenizer, get_sst_dataset, TrainerDataset, truncate_modernbert
 from XAI_Transformers.utils import load_xai_albert
+from XAI_Transformers.xai_distilbert import DistilBertForSequenceClassificationXAI
+from XAI_Transformers.xai_modernbert import ModernBertForSequenceClassificationXAI
 
 def get_top_tokens(explanations, data_loader, tokenizer, ignore_cls, n_tokens=10):
     ids_per_class = defaultdict(list)
@@ -104,10 +105,30 @@ def main():
         model = load_xai_albert(model_name=model_name, device=device, mean_detach=False, std_detach=False)
         model.explain()
         tokenizer_name = 'albert/albert-base-v2'
-    else:
+    elif 'custom-bert' in args.model_name:
         model = load_custom_bert()
         model.explain()
-        tokenizer_name = "textattack/bert-base-uncased-SST-2"
+        tokenizer_name = "bert-base-uncased"
+        args.model_name = 'bert'
+    elif 'modernbert' in args.model_name:
+        model_name = "answerdotai/ModernBERT-base" 
+        tokenizer_name = "answerdotai/ModernBERT-base"
+        model = ModernBertForSequenceClassificationXAI.from_pretrained(
+            model_name,
+            num_labels=2,
+            ignore_mismatched_sizes=True,
+        )
+        model = truncate_modernbert(model, 6)
+        model = model.to(device)
+    elif 'distilbert' in args.model_name:
+        model_name = "distilbert/distilbert-base-uncased" 
+        tokenizer_name = "distilbert/distilbert-base-uncased"
+        model = DistilBertForSequenceClassificationXAI.from_pretrained(
+            model_name, 
+            num_labels=2,
+            ignore_mismatched_sizes=True
+        )
+        model = model.to(device)
         
     
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
@@ -131,6 +152,48 @@ def main():
         val_loader = TrainerDataset(list(ds["validation"]["text"]),
                                     ds["validation"]['label'], tokenizer, 
                                     switch_labels=False)
+        
+    elif 'fever' in args.dataset:
+        fever_path = getattr(
+            args,
+            'fever_prepared_dir',
+            '/vol/csedu-nobackup/project/anonuser/datasets/fever_prepared_seed42'
+        )
+        if not os.path.isdir(fever_path):
+            raise ValueError(
+                f"Prepared FEVER dataset not found at {fever_path}. "
+                "Run thesis/scripts/prepare_fever_dataset.py first."
+            )
+        ds = load_from_disk(fever_path)
+
+        train_loader = TrainerDataset(list(ds["train"]["text"]),
+                                    ds["train"]['label'], tokenizer, 
+                                    switch_labels=False)
+
+        val_loader = TrainerDataset(list(ds["validation"]["text"]),
+                                    ds["validation"]['label'], tokenizer, 
+                                    switch_labels=False)
+    elif 'esnli' in args.dataset:
+        esnli_path = getattr(
+            args,
+            'esnli_prepared_dir',
+            '/vol/csedu-nobackup/project/anonuser/datasets/esnli_prepared_seed42'
+        )
+        if not os.path.isdir(esnli_path):
+            raise ValueError(
+                f"Prepared e-SNLI dataset not found at {esnli_path}. "
+                "Run thesis/scripts/prepare_esnli_dataset.py first."
+            )
+        ds = load_from_disk(esnli_path)
+
+        train_loader = TrainerDataset(list(ds["train"]["text"]),
+                                    ds["train"]['label'], tokenizer, 
+                                    switch_labels=False)
+
+        val_loader = TrainerDataset(list(ds["validation"]["text"]),
+                                    ds["validation"]['label'], tokenizer, 
+                                    switch_labels=False)
+    
     if args.use_top_tokens:
         print("Using most important tokens as target tokens")
         if args.expl_method == 'GAE':
@@ -172,13 +235,14 @@ def main():
         tokens = {"random_tokens": random_tokens}
 
 
-        with open(os.path.join(args.project_dir, f'results/token_frequencies.json'), 'w', encoding='utf-8') as f:
-            json.dump(token_freq, f, indent=4)
+        # with open(os.path.join(args.project_dir, f'results/token_frequencies.json'), 'w', encoding='utf-8') as f:
+        #     json.dump(token_freq, f, indent=4)
+
         # sorted_tokens = sorted(token_freq.items(), key=lambda x: x[1], reverse=True)
         # top_tokens = [token for token, freq in sorted_tokens[:args.n_tokens]]
         # print(f"Top {args.n_tokens} tokens by frequency: {top_tokens}")
     
-    
+    print(tokens)
     write_tokens_file(tokens, args)
 
 if __name__ == "__main__":

@@ -216,6 +216,41 @@ def ensure_tensor_dict(input_dict, device=None, dtype=torch.float32):
     return tensor_dict
 
 
+def get_num_classes(dataset):
+    """
+    Returns the number of classes for the given dataset.
+    args: the arguments object containing dataset information
+    """
+    if 'sst' in dataset:
+        return 2
+    elif 'imdb' in dataset:
+        return 2
+    elif 'fever' in dataset:
+        return 3
+    elif 'esnli' in dataset:
+        return 3
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset}")
+
+def truncate_modernbert(model, n_layers: int):
+    """
+    Keep only the first n ModernBERT layers.
+    Modifies model in-place and returns it.
+    """
+
+    # For ModernBertForSequenceClassification
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        model.model.layers = nn.ModuleList(model.model.layers[:n_layers])
+
+    # For bare ModernBertModel
+    elif hasattr(model, "layers"):
+        model.layers = nn.ModuleList(model.layers[:n_layers])
+
+    else:
+        raise ValueError("Could not find ModernBERT layers.")
+
+    model.config.num_hidden_layers = n_layers
+    return model
 
 def add_nan_forward_watch(model):
         handles = []
@@ -238,6 +273,22 @@ def add_nan_forward_watch(model):
             handles.append(mod.register_forward_hook(fwd(name)))
         return handles
 
+
+def get_model_chkpt_path(run_id):
+    """
+    Returns the path to the model checkpoint based on the run_id.
+    args: the arguments object containing dataset information
+    run_id: the run_id of the checkpoint to load
+    """
+    
+    base_path = '/vol/csedu-nobackup/project/anonuser/results/'
+
+    chkpt_path = os.path.join(base_path, run_id)
+    if not os.path.isdir(chkpt_path):
+        raise ValueError(f"Checkpoint path {chkpt_path} does not exist.")
+    chkpt_dir = os.listdir(chkpt_path)[0]
+    model_name = os.path.join(chkpt_path, chkpt_dir)
+    return model_name
  
 def get_explanations_path(args, dataset_split='train', use_results=False, use_vol=False, run_id=None):
 
@@ -304,6 +355,40 @@ def prep_data(args, tokenizer, tokenize_and_attach, target_tokens=None, handwrit
 
         datasets["validation"] = split["train"]   # becomes validation set
         datasets["test"] = split["test"]          # becomes smaller test set
+    elif 'fever' in args.dataset:
+        fever_path = getattr(
+            args,
+            'fever_prepared_dir',
+            '/vol/csedu-nobackup/project/tromanski/datasets/fever_prepared_seed42'
+        )
+        if not os.path.isdir(fever_path):
+            raise ValueError(
+                f"Prepared FEVER dataset not found at {fever_path}. "
+                "Run thesis/scripts/prepare_fever_dataset.py first."
+            )
+        datasets = load_from_disk(fever_path)
+
+        required_splits = {'train', 'validation', 'test'}
+        missing = required_splits - set(datasets.keys())
+        if missing:
+            raise ValueError(f"Prepared FEVER dataset is missing splits: {sorted(missing)}")
+    elif 'esnli' in args.dataset:
+        esnli_path = getattr(
+            args,
+            'esnli_prepared_dir',
+            '/vol/csedu-nobackup/project/tromanski/datasets/esnli_prepared_seed42'
+        )
+        if not os.path.isdir(esnli_path):
+            raise ValueError(
+                f"Prepared e-SNLI dataset not found at {esnli_path}. "
+                "Run thesis/scripts/prepare_esnli_dataset.py first."
+            )
+        datasets = load_from_disk(esnli_path)
+
+        required_splits = {'train', 'validation', 'test'}
+        missing = required_splits - set(datasets.keys())
+        if missing:
+            raise ValueError(f"Prepared e-SNLI dataset is missing splits: {sorted(missing)}")
     else: 
         raise ValueError(f"Dataset {args.dataset} not supported.")
     
@@ -312,8 +397,11 @@ def prep_data(args, tokenizer, tokenize_and_attach, target_tokens=None, handwrit
             OG_explanations_val = json.load(f)['attributions']
         with open(get_explanations_path(args, dataset_split='train'), 'r') as f:
             OG_explanations_train = json.load(f)['attributions']
-
-        OG_explanations_test = [[] for _ in range(len(datasets['test']))] # no explanations for test set but column needed for tokenizer
+        if args.use_test: 
+            with open(get_explanations_path(args, dataset_split='test'), 'r') as f:
+                OG_explanations_test = json.load(f)['attributions']
+        else:
+            OG_explanations_test = [[] for _ in range(len(datasets['test']))] # no explanations for test set but column needed for tokenizer
 
         datasets['train'] = datasets['train'].add_column('og_R', OG_explanations_train)
         datasets['validation'] = datasets['validation'].add_column('og_R', OG_explanations_val)
@@ -321,8 +409,8 @@ def prep_data(args, tokenizer, tokenize_and_attach, target_tokens=None, handwrit
 
     if 'tokens' in args.approach:
         for split in ['train', 'validation', 'test']:
-            if target_tokens is None or split == 'test':
-                if args.approach == 'increase_tokens':
+            if target_tokens is None or (split == 'test' and not args.use_test):
+                if args.approach == 'increase_tokens' or args.approach == 'increase_tokens_unk':
                     datasets[split] = datasets[split].add_column('target_token_ids', [[] for _ in range(len(datasets[split]))])
                 else:
                     datasets[split] = datasets[split].add_column('target_token_ids_pos', [[] for _ in range(len(datasets[split]))])
@@ -335,17 +423,27 @@ def prep_data(args, tokenizer, tokenize_and_attach, target_tokens=None, handwrit
                         target_token_ids_neg = tokenizer.encode(target_tokens['train']['0'], 
                                                                 add_special_tokens=False, is_split_into_words=True)
                     else:
+                        if args.exclude_special_tokens:
+                            # Remove special tokens if specified
+                            target_tokens['train']['1'] = [tok for tok in target_tokens['train']['1'] 
+                                                          if tok not in ['[CLS]', '[SEP]']]
+                            target_tokens['train']['0'] = [tok for tok in target_tokens['train']['0'] 
+                                                          if tok not in ['[CLS]', '[SEP]']]
                         target_token_ids_pos = tokenizer.convert_tokens_to_ids(target_tokens['train']['1'])
                         target_token_ids_neg = tokenizer.convert_tokens_to_ids(target_tokens['train']['0'])
-                    
+
                     datasets[split] = datasets[split].add_column('target_token_ids_pos', [target_token_ids_pos for _ in range(len(datasets[split]))])
                     datasets[split] = datasets[split].add_column('target_token_ids_neg', [target_token_ids_neg for _ in range(len(datasets[split]))]) 
 
-                elif args.approach == 'increase_tokens':
+                elif args.approach == 'increase_tokens' or args.approach == 'increase_tokens_unk':
                     if handwritten_tokens:
                         target_token_ids = tokenizer.encode(target_tokens['random_tokens'], 
                                                             add_special_tokens=False, is_split_into_words=True)
                     else:
+                        if args.exclude_special_tokens:
+                            # Remove special tokens if specified
+                            target_tokens['random_tokens'] = [tok for tok in target_tokens['random_tokens'] 
+                                                          if tok not in ['[CLS]', '[SEP]']]
                         target_token_ids = tokenizer.convert_tokens_to_ids(target_tokens['random_tokens'])
                     datasets[split] = datasets[split].add_column('target_token_ids', [target_token_ids for _ in range(len(datasets[split]))])
             
@@ -353,6 +451,19 @@ def prep_data(args, tokenizer, tokenize_and_attach, target_tokens=None, handwrit
                     
 
     extra_columns = ["text", "label"]
+    if 'fever' in args.dataset:
+        extra_columns = [
+            "text",
+            "label",
+            "id",
+            "claim",
+            "evidence_sentence",
+            "evidence_annotation_id",
+            "evidence_id",
+            "evidence_wiki_url",
+            "evidence_sentence_id",
+            "is_sampled_nei_evidence",
+        ]
     tokenized = datasets.map(tokenize_and_attach, batched=True, remove_columns=extra_columns)
 
     if args.subsample_size is not None:
@@ -368,9 +479,7 @@ def map_ids_to_tokens_and_attribution(input_ids, tokenizer, attribution):
     return list(zip(tokens, attribution))
 
 
-
-
-
+# below is from XAI transformers repo
 class TrainerDataset(torch.utils.data.Dataset):
     def __init__(self, inputs, targets, tokenizer, switch_labels=False):
         self.inputs = inputs
@@ -385,11 +494,14 @@ class TrainerDataset(torch.utils.data.Dataset):
         return len(self.inputs)
 
     def __getitem__(self, idx):
-        features = {'input_ids':   self.tokenized_inputs['input_ids'][idx],
-                   'token_type_ids':self.tokenized_inputs['token_type_ids'][idx],
-                   'attention_mask':self.tokenized_inputs['attention_mask'][idx],
-                   'label':self.targets[idx]
-                   }
+        features = {
+            'input_ids': self.tokenized_inputs['input_ids'][idx],
+            'attention_mask': self.tokenized_inputs['attention_mask'][idx],
+            'label': self.targets[idx],
+        }
+
+        if 'token_type_ids' in self.tokenized_inputs:
+            features['token_type_ids'] = self.tokenized_inputs['token_type_ids'][idx]
         
         if self.switch_labels:
             features['labels'] = features.pop('label')   
