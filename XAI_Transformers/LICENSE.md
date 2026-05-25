@@ -1,4 +1,4 @@
-MIT License
+MIT License - applies to attribution.py and xai_transformers.py 
 
 Copyright (c) 2022 Ameen Ali
 
